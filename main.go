@@ -49,7 +49,7 @@ type ReadResponseBody struct {
 //	}
 type TopologyRequestBody struct {
 	Type     string              `json:"type"`
-	Topology map[string][]string `json:topology`
+	Topology map[string][]string `json:"topology"`
 }
 
 type TopologyResponseBody struct {
