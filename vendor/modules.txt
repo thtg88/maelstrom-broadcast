@@ -1,3 +1,7 @@
 # github.com/jepsen-io/maelstrom/demo/go v0.0.0-20230312000222-e5cc91c84584
 ## explicit; go 1.19
 github.com/jepsen-io/maelstrom/demo/go
+# golang.org/x/exp v0.0.0-20230310171629-522b1b587ee0
+## explicit; go 1.18
+golang.org/x/exp/constraints
+golang.org/x/exp/slices

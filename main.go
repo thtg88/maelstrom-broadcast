@@ -5,6 +5,7 @@ import (
 	"log"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
+	"golang.org/x/exp/slices"
 )
 
 //	{
@@ -58,8 +59,12 @@ type TopologyResponseBody struct {
 
 func main() {
 	var messages []uint64
+
 	n := maelstrom.NewNode()
 
+	n.Handle("broadcast_ok", func(msg maelstrom.Message) error {
+		return nil
+	})
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		// Unmarshal the message body as an loosely-typed map.
 		var body BroadcastRequestBody
@@ -68,7 +73,26 @@ func main() {
 			return err
 		}
 
+		// If we already received the message, stop broadcasting
+		if slices.Contains(messages, body.Message) {
+			return n.Reply(msg, BroadcastResponseBody{
+				Type: "broadcast_ok",
+			})
+		}
+
 		messages = append(messages, body.Message)
+
+		// Broadcast to everybody
+		for _, node := range n.NodeIDs() {
+			// Don't send the same message to ourselves again
+			if node == n.ID() {
+				continue
+			}
+
+			go func(node string) {
+				n.Send(node, body)
+			}(node)
+		}
 
 		return n.Reply(msg, BroadcastResponseBody{
 			Type: "broadcast_ok",
@@ -91,7 +115,7 @@ func main() {
 
 	n.Handle("topology", func(msg maelstrom.Message) error {
 		// Unmarshal the message body as an loosely-typed map.
-		var body map[string]any
+		var body TopologyRequestBody
 
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
