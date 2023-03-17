@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 	"golang.org/x/exp/slices"
@@ -57,18 +59,83 @@ type TopologyResponseBody struct {
 	Type string `json:"type"`
 }
 
+type UnansweredNodeBroadcast struct {
+	Message uint64
+	Dest    string
+	SentAt  time.Time
+}
+
 func main() {
 	var messages []uint64
 	var topology map[string][]string
+	var unansweredNodeBroadcasts []UnansweredNodeBroadcast
+	// Prevent race condition on shared unansweredNodeBroadcasts access
+	var unansweredNodeBroadcastsMutex sync.Mutex
+	// Prevent race conditions when writing messages
+	var messagesMutex sync.Mutex
+
+	unansweredNodeBroadcastsEventLoopRunning := true
+
+	// Stop the event loop on node teardown
+	defer func() { unansweredNodeBroadcastsEventLoopRunning = false }()
 
 	n := maelstrom.NewNode()
 
+	// This goroutine acts over messages that haven't been answered for >=250ms and resends them
+	go func() {
+		var wg sync.WaitGroup
+
+		for unansweredNodeBroadcastsEventLoopRunning {
+			for _, unansweredNodeBroadcast := range unansweredNodeBroadcasts {
+				if time.Now().UTC().Add(-250*time.Millisecond).UnixMicro() <= unansweredNodeBroadcast.SentAt.UTC().UnixMicro() {
+					continue
+				}
+
+				// If the message hasn't been replied to >250ms, re-send it
+
+				wg.Add(1)
+
+				go func(destination string, message uint64) {
+					defer wg.Done()
+
+					n.Send(destination, BroadcastRequestBody{
+						Type:    "broadcast",
+						Message: message,
+					})
+				}(unansweredNodeBroadcast.Dest, unansweredNodeBroadcast.Message)
+			}
+
+			wg.Wait()
+
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+
 	n.Handle("broadcast_ok", func(msg maelstrom.Message) error {
+		var body BroadcastRequestBody
+
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+
+		for idx, broadcast := range unansweredNodeBroadcasts {
+			if msg.Src != broadcast.Dest || body.Message != broadcast.Message {
+				continue
+			}
+
+			// Remove unanswered broadcast so it doesn't get re-sent by the event loop goroutine
+			unansweredNodeBroadcastsMutex.Lock()
+			unansweredNodeBroadcasts = append(unansweredNodeBroadcasts[:idx], unansweredNodeBroadcasts[idx+1:]...)
+			unansweredNodeBroadcastsMutex.Unlock()
+		}
+
 		return nil
 	})
+
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		// Unmarshal the message body as an loosely-typed map.
 		var body BroadcastRequestBody
+		var wg sync.WaitGroup
 
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
@@ -81,7 +148,9 @@ func main() {
 			})
 		}
 
+		messagesMutex.Lock()
 		messages = append(messages, body.Message)
+		messagesMutex.Unlock()
 
 		destinations := topology[n.ID()]
 
@@ -91,11 +160,26 @@ func main() {
 			})
 		}
 
+		// Send messages to the node's topology
 		for _, node := range destinations {
+			wg.Add(1)
+
 			go func(node string) {
+				defer wg.Done()
+
+				unansweredNodeBroadcastsMutex.Lock()
+				unansweredNodeBroadcasts = append(unansweredNodeBroadcasts, UnansweredNodeBroadcast{
+					Message: body.Message,
+					Dest:    node,
+					SentAt:  time.Now().UTC(),
+				})
+				unansweredNodeBroadcastsMutex.Unlock()
+
 				n.Send(node, body)
 			}(node)
 		}
+
+		wg.Wait()
 
 		return n.Reply(msg, BroadcastResponseBody{
 			Type: "broadcast_ok",
