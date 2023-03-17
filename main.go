@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -87,11 +88,11 @@ func main() {
 
 		for unansweredNodeBroadcastsEventLoopRunning {
 			for _, unansweredNodeBroadcast := range unansweredNodeBroadcasts {
-				if time.Now().UTC().Add(-250*time.Millisecond).UnixMicro() <= unansweredNodeBroadcast.SentAt.UTC().UnixMicro() {
+				if time.Now().UTC().Add(-150*time.Millisecond).UnixMicro() <= unansweredNodeBroadcast.SentAt.UTC().UnixMicro() {
 					continue
 				}
 
-				// If the message hasn't been replied to >250ms, re-send it
+				// If the message hasn't been replied to >150ms, re-send it
 
 				wg.Add(1)
 
@@ -113,20 +114,28 @@ func main() {
 
 	n.Handle("broadcast_ok", func(msg maelstrom.Message) error {
 		var body BroadcastRequestBody
+		var idxsToRemove []int
 
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
 
+		unansweredNodeBroadcastsMutex.Lock()
+		defer unansweredNodeBroadcastsMutex.Unlock()
 		for idx, broadcast := range unansweredNodeBroadcasts {
 			if msg.Src != broadcast.Dest || body.Message != broadcast.Message {
 				continue
 			}
 
-			// Remove unanswered broadcast so it doesn't get re-sent by the event loop goroutine
-			unansweredNodeBroadcastsMutex.Lock()
+			idxsToRemove = append(idxsToRemove, idx)
+		}
+
+		// Reverse the array so removing elements is stable
+		sort.Sort(sort.Reverse(sort.IntSlice(idxsToRemove)))
+
+		// Remove unanswered broadcasts so they don't get re-sent by the event loop goroutine
+		for _, idx := range idxsToRemove {
 			unansweredNodeBroadcasts = append(unansweredNodeBroadcasts[:idx], unansweredNodeBroadcasts[idx+1:]...)
-			unansweredNodeBroadcastsMutex.Unlock()
 		}
 
 		return nil
