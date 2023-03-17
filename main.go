@@ -59,6 +59,7 @@ type TopologyResponseBody struct {
 
 func main() {
 	var messages []uint64
+	var topology map[string][]string
 
 	n := maelstrom.NewNode()
 
@@ -82,13 +83,15 @@ func main() {
 
 		messages = append(messages, body.Message)
 
-		// Broadcast to everybody
-		for _, node := range n.NodeIDs() {
-			// Don't send the same message to ourselves again
-			if node == n.ID() {
-				continue
-			}
+		destinations := topology[n.ID()]
 
+		if destinations == nil {
+			return n.Reply(msg, BroadcastResponseBody{
+				Type: "broadcast_ok",
+			})
+		}
+
+		for _, node := range destinations {
 			go func(node string) {
 				n.Send(node, body)
 			}(node)
@@ -120,6 +123,8 @@ func main() {
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
+
+		topology = body.Topology
 
 		return n.Reply(msg, TopologyResponseBody{
 			Type: "topology_ok",
