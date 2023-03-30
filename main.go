@@ -68,10 +68,10 @@ type UnansweredNodeBroadcast struct {
 
 func main() {
 	var messages []uint64
-	var topology map[string][]string
 	var unansweredNodeBroadcasts []UnansweredNodeBroadcast
 	// Prevent race condition on shared unansweredNodeBroadcasts access
 	var unansweredNodeBroadcastsMutex sync.Mutex
+	var destinations []string
 	// Prevent race conditions when writing messages
 	var messagesMutex sync.Mutex
 
@@ -217,7 +217,8 @@ func main() {
 			return err
 		}
 
-		topology = body.Topology
+		// Only store the destinations for our node
+		destinations = body.Topology[n.ID()]
 
 		return n.Reply(msg, TopologyResponseBody{
 			Type: "topology_ok",
