@@ -2,8 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
-	"sort"
 	"sync"
 	"time"
 
@@ -60,6 +60,11 @@ type TopologyResponseBody struct {
 	Type string `json:"type"`
 }
 
+type BroadcastOkResponseBody struct {
+	InReplyTo int    `json:"in_reply_to"`
+	Type      string `json:"type"`
+}
+
 type UnansweredNodeBroadcast struct {
 	Message uint64
 	Dest    string
@@ -68,83 +73,19 @@ type UnansweredNodeBroadcast struct {
 
 func main() {
 	var messages []uint64
-	var unansweredNodeBroadcasts []UnansweredNodeBroadcast
-	// Prevent race condition on shared unansweredNodeBroadcasts access
-	var unansweredNodeBroadcastsMutex sync.Mutex
 	var destinations []string
 	// Prevent race conditions when writing messages
 	var messagesMutex sync.Mutex
 
-	unansweredNodeBroadcastsEventLoopRunning := true
-
-	// Stop the event loop on node teardown
-	defer func() { unansweredNodeBroadcastsEventLoopRunning = false }()
-
 	n := maelstrom.NewNode()
 
-	// This goroutine acts over messages that haven't been answered for >=250ms and resends them
-	go func() {
-		var wg sync.WaitGroup
-
-		for unansweredNodeBroadcastsEventLoopRunning {
-			for _, unansweredNodeBroadcast := range unansweredNodeBroadcasts {
-				if time.Now().UTC().Add(-150*time.Millisecond).UnixMicro() <= unansweredNodeBroadcast.SentAt.UTC().UnixMicro() {
-					continue
-				}
-
-				// If the message hasn't been replied to >150ms, re-send it
-
-				wg.Add(1)
-
-				go func(destination string, message uint64) {
-					defer wg.Done()
-
-					n.Send(destination, BroadcastRequestBody{
-						Type:    "broadcast",
-						Message: message,
-					})
-				}(unansweredNodeBroadcast.Dest, unansweredNodeBroadcast.Message)
-			}
-
-			wg.Wait()
-
-			time.Sleep(100 * time.Millisecond)
-		}
-	}()
-
 	n.Handle("broadcast_ok", func(msg maelstrom.Message) error {
-		var body BroadcastRequestBody
-		var idxsToRemove []int
-
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
-			return err
-		}
-
-		unansweredNodeBroadcastsMutex.Lock()
-		defer unansweredNodeBroadcastsMutex.Unlock()
-		for idx, broadcast := range unansweredNodeBroadcasts {
-			if msg.Src != broadcast.Dest || body.Message != broadcast.Message {
-				continue
-			}
-
-			idxsToRemove = append(idxsToRemove, idx)
-		}
-
-		// Reverse the array so removing elements is stable
-		sort.Sort(sort.Reverse(sort.IntSlice(idxsToRemove)))
-
-		// Remove unanswered broadcasts so they don't get re-sent by the event loop goroutine
-		for _, idx := range idxsToRemove {
-			unansweredNodeBroadcasts = append(unansweredNodeBroadcasts[:idx], unansweredNodeBroadcasts[idx+1:]...)
-		}
-
 		return nil
 	})
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		// Unmarshal the message body as an loosely-typed map.
 		var body BroadcastRequestBody
-		var wg sync.WaitGroup
 
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
@@ -161,34 +102,41 @@ func main() {
 		messages = append(messages, body.Message)
 		messagesMutex.Unlock()
 
-		destinations := topology[n.ID()]
+		go func(destinations []string, body BroadcastRequestBody) {
+			var successfulSentDestinations []string
+			var successfulSentDestinationsMutex sync.Mutex
+			// Send messages to the node's destinations
+			// Until we got none left
+			for len(destinations) != len(successfulSentDestinations) {
+				for _, node := range destinations {
+					n.RPC(node, body, func(msg maelstrom.Message) error {
+						var broadcastOkBody BroadcastOkResponseBody
 
-		if destinations == nil {
-			return n.Reply(msg, BroadcastResponseBody{
-				Type: "broadcast_ok",
-			})
-		}
+						if err := json.Unmarshal(msg.Body, &broadcastOkBody); err != nil {
+							return err
+						}
 
-		// Send messages to the node's topology
-		for _, node := range destinations {
-			wg.Add(1)
+						if broadcastOkBody.Type != "broadcast_ok" {
+							return fmt.Errorf("expeted type broadcast_ok, got %s", broadcastOkBody.Type)
+						}
 
-			go func(node string) {
-				defer wg.Done()
+						log.Printf("from %s, to %s, sent %v", n.ID(), node, body)
 
-				unansweredNodeBroadcastsMutex.Lock()
-				unansweredNodeBroadcasts = append(unansweredNodeBroadcasts, UnansweredNodeBroadcast{
-					Message: body.Message,
-					Dest:    node,
-					SentAt:  time.Now().UTC(),
-				})
-				unansweredNodeBroadcastsMutex.Unlock()
+						successfulSentDestinationsMutex.Lock()
+						defer successfulSentDestinationsMutex.Unlock()
 
-				n.Send(node, body)
-			}(node)
-		}
+						// Check if we already marked the destination node as successfully sent
+						if !slices.Contains(successfulSentDestinations, node) {
+							successfulSentDestinations = append(successfulSentDestinations, node)
+						}
 
-		wg.Wait()
+						return nil
+					})
+				}
+
+				time.Sleep(1 * time.Second)
+			}
+		}(destinations, body)
 
 		return n.Reply(msg, BroadcastResponseBody{
 			Type: "broadcast_ok",
