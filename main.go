@@ -2,7 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
+	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 	"golang.org/x/exp/slices"
@@ -57,15 +60,29 @@ type TopologyResponseBody struct {
 	Type string `json:"type"`
 }
 
+type BroadcastOkResponseBody struct {
+	InReplyTo int    `json:"in_reply_to"`
+	Type      string `json:"type"`
+}
+
+type UnansweredNodeBroadcast struct {
+	Message uint64
+	Dest    string
+	SentAt  time.Time
+}
+
 func main() {
 	var messages []uint64
-	var topology map[string][]string
+	var destinations []string
+	// Prevent race conditions when writing messages
+	var messagesMutex sync.Mutex
 
 	n := maelstrom.NewNode()
 
 	n.Handle("broadcast_ok", func(msg maelstrom.Message) error {
 		return nil
 	})
+
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		// Unmarshal the message body as an loosely-typed map.
 		var body BroadcastRequestBody
@@ -81,21 +98,45 @@ func main() {
 			})
 		}
 
+		messagesMutex.Lock()
 		messages = append(messages, body.Message)
+		messagesMutex.Unlock()
 
-		destinations := topology[n.ID()]
+		go func(destinations []string, body BroadcastRequestBody) {
+			var successfulSentDestinations []string
+			var successfulSentDestinationsMutex sync.Mutex
+			// Send messages to the node's destinations
+			// Until we got none left
+			for len(destinations) != len(successfulSentDestinations) {
+				for _, node := range destinations {
+					n.RPC(node, body, func(msg maelstrom.Message) error {
+						var broadcastOkBody BroadcastOkResponseBody
 
-		if destinations == nil {
-			return n.Reply(msg, BroadcastResponseBody{
-				Type: "broadcast_ok",
-			})
-		}
+						if err := json.Unmarshal(msg.Body, &broadcastOkBody); err != nil {
+							return err
+						}
 
-		for _, node := range destinations {
-			go func(node string) {
-				n.Send(node, body)
-			}(node)
-		}
+						if broadcastOkBody.Type != "broadcast_ok" {
+							return fmt.Errorf("expeted type broadcast_ok, got %s", broadcastOkBody.Type)
+						}
+
+						log.Printf("from %s, to %s, sent %v", n.ID(), node, body)
+
+						successfulSentDestinationsMutex.Lock()
+						defer successfulSentDestinationsMutex.Unlock()
+
+						// Check if we already marked the destination node as successfully sent
+						if !slices.Contains(successfulSentDestinations, node) {
+							successfulSentDestinations = append(successfulSentDestinations, node)
+						}
+
+						return nil
+					})
+				}
+
+				time.Sleep(1 * time.Second)
+			}
+		}(destinations, body)
 
 		return n.Reply(msg, BroadcastResponseBody{
 			Type: "broadcast_ok",
@@ -124,7 +165,8 @@ func main() {
 			return err
 		}
 
-		topology = body.Topology
+		// Only store the destinations for our node
+		destinations = body.Topology[n.ID()]
 
 		return n.Reply(msg, TopologyResponseBody{
 			Type: "topology_ok",
